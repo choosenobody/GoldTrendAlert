@@ -1,4 +1,3 @@
-
 name: Valuation Grid Backtest
 
 on:
@@ -24,6 +23,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pandas yfinance numpy
 
+      # （可选）预检：确保 WGC_CSV_URL 可访问
+      - name: Preflight WGC_CSV_URL
+        env:
+          WGC_CSV_URL: ${{ vars.WGC_CSV_URL }}
+        run: |
+          echo "WGC_CSV_URL=$WGC_CSV_URL"
+          curl -I --max-time 10 "$WGC_CSV_URL"
+
       - name: Run grid backtest
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
@@ -37,7 +44,6 @@ jobs:
         run: |
           ls -la .bot_state || true
           if [ -f .bot_state/valuation_grid_top20.csv ]; then
-            echo "Top 20 parameter sets:"
             sed -n '1,200p' .bot_state/valuation_grid_top20.csv
           else
             echo "No result file (.bot_state/valuation_grid_top20.csv)"
