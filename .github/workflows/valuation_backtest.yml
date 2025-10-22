@@ -42,6 +42,8 @@ jobs:
     echo "---- total lines ----"
     curl -sS "$WGC_CSV_URL" | wc -l
 
+
+
       - name: Run grid backtest
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
