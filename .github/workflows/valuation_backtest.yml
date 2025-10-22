@@ -23,26 +23,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pandas yfinance numpy
 
-      # （可选）预检：确保 WGC_CSV_URL 可访问
+      # 预检：确保 WGC_CSV_URL 可访问且看得到前几行
       - name: Preflight WGC_CSV_URL
         env:
           WGC_CSV_URL: ${{ vars.WGC_CSV_URL }}
         run: |
           echo "WGC_CSV_URL=$WGC_CSV_URL"
           curl -I --max-time 10 "$WGC_CSV_URL"
-
-- name: Preflight WGC_CSV_URL
-  env:
-    WGC_CSV_URL: ${{ vars.WGC_CSV_URL }}
-  run: |
-    echo "WGC_CSV_URL=$WGC_CSV_URL"
-    curl -I --max-time 10 "$WGC_CSV_URL"
-    echo "---- first 10 lines ----"
-    curl -sS "$WGC_CSV_URL" | sed -n '1,10p'
-    echo "---- total lines ----"
-    curl -sS "$WGC_CSV_URL" | wc -l
-
-
+          echo "---- first 10 lines ----"
+          curl -sS "$WGC_CSV_URL" | sed -n '1,10p'
 
       - name: Run grid backtest
         env:
@@ -50,6 +39,8 @@ jobs:
           WGC_CSV_URL: ${{ vars.WGC_CSV_URL }}
           FRED_GOLD_SERIES_ID: ${{ vars.FRED_GOLD_SERIES_ID }}
           REG_WINDOW_M: ${{ vars.REG_WINDOW_M }}
+          # 如你的 WGC 样本不足 25 个月，可先设为 6；补齐后改回 12
+          CB_YOY_ROLL_M: ${{ vars.CB_YOY_ROLL_M }}
         run: |
           python tools/valuation_backtest_grid_v1.py
 
@@ -57,6 +48,7 @@ jobs:
         run: |
           ls -la .bot_state || true
           if [ -f .bot_state/valuation_grid_top20.csv ]; then
+            echo "Top 20 parameter sets:"
             sed -n '1,200p' .bot_state/valuation_grid_top20.csv
           else
             echo "No result file (.bot_state/valuation_grid_top20.csv)"
