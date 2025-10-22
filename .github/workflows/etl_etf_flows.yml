@@ -1,9 +1,10 @@
-
 name: ETF Flows ETL (Farside -> CSV)
+
 on:
   schedule:
-    - cron: "0 1 * * 2-6"   # Tue-Sat 01:00 UTC (after US close)
-  workflow_dispatch: {}
+    - cron: "0 1 * * 2-6"   # Tue-Sat 01:00 UTC (~美股收盘后)
+  workflow_dispatch:
+
 jobs:
   etl:
     runs-on: ubuntu-latest
@@ -19,45 +20,37 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pandas lxml html5lib
 
-      - name: Ensure ETL script exists
-        run: |
-          mkdir -p tools .bot_state
-          if [ ! -f "tools/etl_farside_to_csv.py" ]; then
-            cat > tools/etl_farside_to_csv.py << 'PY'
-#!/usr/bin/env python3
-import requests, pandas as pd, io, sys, os
-URL = os.environ.get("FARSIDE_ALLDATA_URL","https://farside.co.uk/bitcoin-etf-flow-all-data/")
-UA = {"User-Agent":"ETF-ETL/1.0"}
-r = requests.get(URL, headers=UA, timeout=25); r.raise_for_status()
-tables = pd.read_html(r.text)
-candidate=None; best=0
-for t in tables:
-    if t.shape[1] < 2: continue
-    df=t.copy()
-    try:
-        pd.to_datetime(df.iloc[:,0], errors="raise")
-        if len(df)>best: candidate=df; best=len(df)
-    except Exception:
-        continue
-if candidate is None:
-    raise SystemExit("No parseable table from Farside")
-df = candidate[[candidate.columns[0], candidate.columns[-1]]].copy()
-df.columns=["Date","NetFlowUSD"]
-df["Date"]=pd.to_datetime(df["Date"], errors="coerce")
-df["NetFlowUSD"]=pd.to_numeric(df["NetFlowUSD"], errors="coerce")
-df=df.dropna().sort_values("Date")
-os.makedirs(".bot_state", exist_ok=True)
-df.to_csv(".bot_state/btc_spot_etf_flows.csv", index=False)
-print("[OK] Wrote .bot_state/btc_spot_etf_flows.csv with", len(df), "rows")
-            PY
-            chmod +x tools/etl_farside_to_csv.py
-          fi
-
-      - name: Run ETL
+      - name: Build CSV from Farside (inline)
         env:
           FARSIDE_ALLDATA_URL: ${{ vars.FARSIDE_ALLDATA_URL }}
         run: |
-          python tools/etl_farside_to_csv.py
+          python - <<'PY'
+          import os, requests, pandas as pd
+          url = os.environ.get("FARSIDE_ALLDATA_URL","https://farside.co.uk/bitcoin-etf-flow-all-data/")
+          r = requests.get(url, headers={"User-Agent":"ETF-ETL/1.0"}, timeout=25); r.raise_for_status()
+          tables = pd.read_html(r.text)
+          cand=None; best=0
+          for t in tables:
+              if t.shape[1] < 2: 
+                  continue
+              df = t.copy()
+              try:
+                  pd.to_datetime(df.iloc[:,0], errors="raise")
+                  if len(df) > best:
+                      cand=df; best=len(df)
+              except Exception:
+                  pass
+          if cand is None:
+              raise SystemExit("No parseable table from Farside")
+          df = cand[[cand.columns[0], cand.columns[-1]]].copy()
+          df.columns = ["Date","NetFlowUSD"]
+          df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+          df["NetFlowUSD"] = pd.to_numeric(df["NetFlowUSD"], errors="coerce")
+          df = df.dropna().sort_values("Date")
+          os.makedirs(".bot_state", exist_ok=True)
+          df.to_csv(".bot_state/btc_spot_etf_flows.csv", index=False)
+          print("[OK] rows:", len(df))
+          PY
 
       - name: Commit CSV
         run: |
