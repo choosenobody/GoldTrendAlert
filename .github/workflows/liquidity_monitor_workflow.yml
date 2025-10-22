@@ -1,4 +1,4 @@
-name: Liquidity Monitor Bot v1.5.1
+name: Liquidity Monitor Bot v1.5.2
 
 on:
   schedule:
@@ -47,6 +47,8 @@ jobs:
           ETF_LONG_D: ${{ vars.ETF_LONG_D }}
           AUCTION_WINDOW_D: ${{ vars.AUCTION_WINDOW_D }}
           MODE: send
+          VAL_GAP_PCT: ${{ vars.VAL_GAP_PCT }}
+          ETF_WINDOW_CANDIDATES: ${{ vars.ETF_WINDOW_CANDIDATES }}
         run: |
           export GOLD_FAIR_BASE="${GOLD_FAIR_BASE:-REG}"
-          python liquidity_monitor_bot_v1_5_1.py
+          python liquidity_monitor_bot_v1_5_2.py
