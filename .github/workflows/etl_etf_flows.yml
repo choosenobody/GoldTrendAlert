@@ -1,4 +1,4 @@
-name: ETF Flows ETL (Farside -> CSV)
+name: ETF Flows ETL (SoSoValue -> CSV; Farside fallback)
 
 on:
   schedule:
@@ -20,36 +20,125 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pandas lxml html5lib
 
-      - name: Build CSV from Farside (inline)
+      - name: Build CSV (SoSoValue first, Farside as fallback)
         env:
+          # SoSoValue（推荐；若已在仓库 Variables 里配置，这里会自动读取）
+          BTC_ETF_API_URL: ${{ vars.BTC_ETF_API_URL }}
+          BTC_ETF_API_METHOD: ${{ vars.BTC_ETF_API_METHOD }}
+          BTC_ETF_API_HEADERS: ${{ vars.BTC_ETF_API_HEADERS }}
+          BTC_ETF_API_BODY: ${{ vars.BTC_ETF_API_BODY }}
+          BTC_ETF_API_DATE_FIELD: ${{ vars.BTC_ETF_API_DATE_FIELD }}
+          BTC_ETF_API_FLOW_FIELD: ${{ vars.BTC_ETF_API_FLOW_FIELD }}
+          # Farside（兜底）
           FARSIDE_ALLDATA_URL: ${{ vars.FARSIDE_ALLDATA_URL }}
         run: |
           python - <<'PY'
-          import os, requests, pandas as pd
-          url = os.environ.get("FARSIDE_ALLDATA_URL","https://farside.co.uk/bitcoin-etf-flow-all-data/")
-          r = requests.get(url, headers={"User-Agent":"ETF-ETL/1.0"}, timeout=25); r.raise_for_status()
-          tables = pd.read_html(r.text)
-          cand=None; best=0
-          for t in tables:
-              if t.shape[1] < 2: 
-                  continue
-              df = t.copy()
+          import os, json, requests, pandas as pd, io
+          from datetime import datetime
+
+          def write_csv(df):
+              df = df.copy()
+              df.columns = ["Date","NetFlowUSD"]
+              df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+              df["NetFlowUSD"] = pd.to_numeric(df["NetFlowUSD"], errors="coerce")
+              df = df.dropna().sort_values("Date")
+              os.makedirs(".bot_state", exist_ok=True)
+              out = ".bot_state/btc_spot_etf_flows.csv"
+              df.to_csv(out, index=False)
+              print("[OK] wrote", out, "rows:", len(df))
+
+          def try_sosovalue():
+              url = os.environ.get("BTC_ETF_API_URL")
+              method = (os.environ.get("BTC_ETF_API_METHOD") or "POST").upper()
+              hdrs = os.environ.get("BTC_ETF_API_HEADERS") or ""
+              body = os.environ.get("BTC_ETF_API_BODY") or '{"type":"us-btc-spot"}'
+              date_f = os.environ.get("BTC_ETF_API_DATE_FIELD") or "date"
+              flow_f = os.environ.get("BTC_ETF_API_FLOW_FIELD") or "totalNetInflow"
+              if not url:
+                  return False, "no-url"
               try:
-                  pd.to_datetime(df.iloc[:,0], errors="raise")
-                  if len(df) > best:
-                      cand=df; best=len(df)
-              except Exception:
-                  pass
-          if cand is None:
-              raise SystemExit("No parseable table from Farside")
-          df = cand[[cand.columns[0], cand.columns[-1]]].copy()
-          df.columns = ["Date","NetFlowUSD"]
-          df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-          df["NetFlowUSD"] = pd.to_numeric(df["NetFlowUSD"], errors="coerce")
-          df = df.dropna().sort_values("Date")
-          os.makedirs(".bot_state", exist_ok=True)
-          df.to_csv(".bot_state/btc_spot_etf_flows.csv", index=False)
-          print("[OK] rows:", len(df))
+                  headers = {"User-Agent":"ETL/1.1"}
+                  try:
+                      headers.update(json.loads(hdrs))
+                  except Exception:
+                      pass
+                  if method=="POST":
+                      try:
+                          j = json.loads(body)
+                          r = requests.post(url, headers=headers, json=j, timeout=30)
+                      except Exception:
+                          r = requests.post(url, headers=headers, data=body, timeout=30)
+                  else:
+                      r = requests.get(url, headers=headers, timeout=30)
+                  r.raise_for_status()
+                  jr = r.json()
+                  data = jr.get("data", jr)
+                  rows = data.get("list", []) if isinstance(data, dict) else (data if isinstance(data,list) else [])
+                  if not rows:
+                      return False, "no-rows"
+                  df = pd.DataFrame(rows)
+                  if date_f not in df.columns or flow_f not in df.columns:
+                      # try best-effort mapping
+                      dcol = None
+                      for c in df.columns:
+                          if str(c).lower() in ("date","day","datetime"): dcol = c; break
+                      fcol = None
+                      for c in df.columns:
+                          lc = str(c).lower()
+                          if ("inflow" in lc) or lc.endswith("flow") or lc.endswith("net"):
+                              fcol = c; break
+                      if not dcol or not fcol:
+                          return False, "bad-cols"
+                      date_f, flow_f = dcol, fcol
+                  df = df[[date_f, flow_f]].rename(columns={date_f:"Date", flow_f:"NetFlowUSD"})
+                  write_csv(df)
+                  return True, "sosovalue"
+              except requests.HTTPError as e:
+                  return False, f"http {e.response.status_code}"
+              except Exception as e:
+                  return False, f"err {type(e).__name__}"
+
+          def try_farside():
+              base = os.environ.get("FARSIDE_ALLDATA_URL","https://farside.co.uk/bitcoin-etf-flow-all-data/")
+              headers = {"User-Agent":"ETF-ETL/1.1"}
+              def fetch(u):
+                  r = requests.get(u, headers=headers, timeout=30); r.raise_for_status(); return r.text
+              html = None
+              try:
+                  html = fetch(base)
+              except requests.HTTPError as e:
+                  if e.response is not None and e.response.status_code==403:
+                      # fallback via read-only proxy mirror
+                      mirror = "https://r.jina.ai/http://farside.co.uk/bitcoin-etf-flow-all-data/"
+                      html = fetch(mirror)
+                  else:
+                      raise
+              import pandas as pd
+              tables = pd.read_html(html)
+              cand=None; best=0
+              for t in tables:
+                  if t.shape[1] < 2: continue
+                  df = t.copy()
+                  try:
+                      pd.to_datetime(df.iloc[:,0], errors="raise")
+                      if len(df)>best:
+                          cand=df; best=len(df)
+                  except Exception:
+                      pass
+              if cand is None:
+                  raise SystemExit("No parseable table from Farside (even mirror)")
+              df = cand[[cand.columns[0], cand.columns[-1]]].copy()
+              df.columns = ["Date","NetFlowUSD"]
+              write_csv(df)
+              return True
+
+          ok, src = try_sosovalue()
+          if ok:
+              print("[SRC] SoSoValue")
+          else:
+              print("[WARN] SoSoValue failed:", src, "→ try Farside…")
+              ok = try_farside()
+              if ok: print("[SRC] Farside (direct/mirror)")
           PY
 
       - name: Commit CSV
