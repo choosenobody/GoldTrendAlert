@@ -1,9 +1,13 @@
-
 name: Liquidity Monitor Bot v1.4.0
+
 on:
   schedule:
     - cron: "0 13 * * 0"   # Sun 13:00 UTC == Sun 21:00 GMT+8
-  workflow_dispatch: {}
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -19,21 +23,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pandas yfinance python-dateutil lxml html5lib
 
-      - name: Sanity
-        run: |
-          python - << 'PY'
-          import sys, os
-          print(sys.version)
-          print("repo files:", os.listdir("."))
-          PY
-
       - name: Run bot (send)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-          # FRED for TIPS & DXY
+          # FRED for TIPS & DXY & GOLD
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          FRED_GOLD_SERIES_ID: ${{ vars.FRED_GOLD_SERIES_ID }}
 
           # Optional overrides
           GOLD_CB_PURCHASE_T: ${{ secrets.GOLD_CB_PURCHASE_T }}
@@ -46,7 +43,7 @@ jobs:
           IMF_FREQ: ${{ vars.IMF_FREQ }}
           IMF_INDICATOR_CANDIDATES: ${{ vars.IMF_INDICATOR_CANDIDATES }}
 
-          # ETF sources
+          # ETF sources (CSV→API→Farside)
           BTC_ETF_FLOWS_CSV_URL: ${{ vars.BTC_ETF_FLOWS_CSV_URL }}
           BTC_ETF_API_URL: ${{ vars.BTC_ETF_API_URL }}
           BTC_ETF_API_METHOD: ${{ vars.BTC_ETF_API_METHOD }}
@@ -67,5 +64,7 @@ jobs:
 
           MODE: send
         run: |
+          # 动态估值基准：若未显式配置，则启用 AUTO
           export GOLD_FAIR_BASE="${GOLD_FAIR_BASE:-AUTO}"
-          python liquidity_monitor_bot_v1_4_1.py
+
+          python liquidity_monitor_bot_v1_4_2.py
