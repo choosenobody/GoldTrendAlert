@@ -427,7 +427,8 @@ def main():
     sep="-"*len(header)
     table_lines=[header,sep]+[f"{r[0].ljust(w1)}  {str(r[1]).ljust(w2)}  {str(r[2]).ljust(w3)}  {r[3]}" for r in rows]
     lines.append("<b>数据小表</b>：")
-    lines.append(f"<pre><code>{html.escape('\n'.join(table_lines))}</code></pre>")
+    table_html = html.escape("\n".join(table_lines))
+    lines.append(f"<pre><code>{table_html}</code></pre>")
 
     msg="\n".join(lines)
 
