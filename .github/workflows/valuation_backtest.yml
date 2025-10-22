@@ -1,0 +1,217 @@
+
+name: Valuation Grid Backtest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas yfinance numpy
+
+      - name: Run grid backtest
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          WGC_CSV_URL: ${{ vars.WGC_CSV_URL }}
+          FRED_GOLD_SERIES_ID: ${{ vars.FRED_GOLD_SERIES_ID }}
+          REG_WINDOW_M: ${{ vars.REG_WINDOW_M }}
+        run: |
+          mkdir -p tools
+          python - <<'PY'
+          from pathlib import Path
+          print("tools exists:", Path("tools").exists())
+          PY
+          cat > tools/valuation_backtest_grid_v1.py << 'PY'
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Valuation Backtest Grid (v1): 扫描 BETA_TIPS / ALPHA_CB / GAP_PCT，
+用月频历史数据，生成 Sharpe & 最大回撤，并输出前N组合。
+"""
+import os, io, sys, json
+from datetime import datetime, timedelta
+import numpy as np
+import pandas as pd
+import requests, yfinance as yf
+
+TIMEOUT=25
+UA={"User-Agent":"ValuationBacktest/1.0"}
+
+def env(k,d=None):
+    v=os.environ.get(k)
+    return v if (v is not None and str(v).strip()!="") else d
+
+def get_stooq_xau_series():
+    try:
+        url = "https://stooq.com/q/d/l/?s=xauusd&i=d"
+        r = requests.get(url, headers=UA, timeout=TIMEOUT); r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        df["Date"]=pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date","Close"]).sort_values("Date")
+        s = pd.to_numeric(df["Close"], errors="coerce").dropna()
+        s.index = df["Date"]
+        return s if len(s)>0 else None
+    except Exception:
+        return None
+
+def get_fred_series(series_id, days=365*12):
+    key = env("FRED_API_KEY")
+    if not key: return None
+    url="https://api.stlouisfed.org/fred/series/observations"
+    params={"series_id":series_id,"api_key":key,"file_type":"json","observation_start":(datetime.utcnow()-timedelta(days=days)).strftime("%Y-%m-%d")}
+    r=requests.get(url, params=params, headers=UA, timeout=TIMEOUT); r.raise_for_status()
+    obs=r.json().get("observations",[])
+    dates=[o["date"] for o in obs]
+    vals=[(None if o.get("value") in (".", None) else float(o["value"])) for o in obs]
+    s=pd.Series(vals, index=pd.to_datetime(dates, errors="coerce")).dropna()
+    return s
+
+def get_gold_daily():
+    s=get_stooq_xau_series()
+    if s is None:
+        s = get_fred_series(env("FRED_GOLD_SERIES_ID","GOLDPMGBD228NLBM"), days=365*12)
+    if s is None:
+        df=yf.download("GC=F", period="10y", interval="1d", progress=False, auto_adjust=False)
+        if df is not None and not df.empty:
+            s=df["Close"].dropna()
+    return s
+
+def parse_wgc(csv_text):
+    df=pd.read_csv(io.StringIO(csv_text))
+    dcol=None
+    for c in df.columns:
+        if str(c).lower() in ("month","date","period","time","month_end"): dcol=c; break
+    if dcol is None:
+        for c in df.columns:
+            try: pd.to_datetime(df[c], errors="raise"); dcol=c; break
+            except: pass
+    lower={str(c).lower().replace(" ",""): c for c in df.columns}
+    vcol=None
+    for name in ["netpurchasetons","net_purchase_tons","net","nettons","netcentralbankpurchases","cb_net_buy_tons","value","amount"]:
+        if name in lower: vcol=lower[name]; break
+    if vcol is None:
+        nums=[c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if nums: vcol=nums[0]
+    if not dcol or not vcol: return None
+    df=df[[dcol,vcol]].copy()
+    df[dcol]=pd.to_datetime(df[dcol], errors="coerce")
+    df[vcol]=pd.to_numeric(df[vcol], errors="coerce")
+    df=df.dropna().sort_values(dcol)
+    df["M"]=df[dcol].dt.to_period("M").dt.to_timestamp("M")
+    s=df.groupby("M")[vcol].sum()
+    return s
+
+def regression_intercept(y_gold_m, tips_m, cby_m, window):
+    df=pd.concat([y_gold_m.rename("gold"), tips_m.rename("tips"), cby_m.rename("cby")], axis=1).dropna()
+    if len(df) < window+3: return None
+    df=df.iloc[-window:]
+    import numpy as np
+    Y=df["gold"].values.astype(float)
+    X=np.column_stack([np.ones(len(df)), -df["tips"].values.astype(float), df["cby"].values.astype(float)])
+    coef,_res,_rank,_s = np.linalg.lstsq(X,Y,rcond=None)
+    return float(coef[0])
+
+def sharpe_and_mdd(ret_m):
+    if len(ret_m)<6: return -999, 0
+    mu = ret_m.mean()*12
+    sigma = ret_m.std(ddof=1)* (12**0.5)
+    sharpe = -999 if sigma==0 else mu/sigma
+    curve = (1+ret_m).cumprod()
+    peak = curve.cummax()
+    dd = (curve/peak)-1.0
+    mdd = float(dd.min())
+    return float(sharpe), mdd
+
+def main():
+    gold_d = get_gold_daily()
+    assert gold_d is not None and len(gold_d)>300, "Gold series too short"
+    gold_m = gold_d.resample("M").last().dropna()
+
+    tips_d = get_fred_series("DFII10", days=365*12)
+    assert tips_d is not None and len(tips_d)>300, "TIPS series too short"
+    tips_m = tips_d.resample("M").mean().dropna()
+
+    wgc_url = env("WGC_CSV_URL"); assert wgc_url, "Set WGC_CSV_URL"
+    r=requests.get(wgc_url, headers=UA, timeout=TIMEOUT); r.raise_for_status()
+    s_net = parse_wgc(r.text); assert s_net is not None and len(s_net)>24, "WGC series invalid"
+    roll12 = s_net.rolling(12).sum().dropna()
+    cby = ((roll12 - roll12.shift(12))/roll12.shift(12))*100.0
+    cby_m = cby.dropna()
+
+    df = pd.concat([gold_m.rename("gold"), tips_m.rename("tips"), cby_m.rename("cby")], axis=1).dropna()
+    df["ret"] = df["gold"].pct_change().shift(-1)
+    df = df.dropna()
+
+    REG_WINDOW_M = int(env("REG_WINDOW_M","36"))
+    GAP_LIST = [8,10,12]
+    BETA_LIST = [0.2,0.3,0.4]
+    ALPHA_LIST = [0.01,0.02,0.03]
+
+    results=[]
+    for gap_pct in GAP_LIST:
+        for beta in BETA_LIST:
+            for alpha in ALPHA_LIST:
+                pos=[]; comp_list=[]
+                for i in range(REG_WINDOW_M, len(df)-1):
+                    sub = df.iloc[:i].copy()
+                    base = regression_intercept(sub["gold"], sub["tips"], sub["cby"], REG_WINDOW_M)
+                    if base is None:
+                        base = float(sub["gold"].ewm(span=36, adjust=False).mean().iloc[-1])
+                    cur = df.iloc[i]
+                    fair = base + beta * (0 - float(cur["tips"])) + alpha * float(cur["cby"]) * base
+                    gap = (float(cur["gold"]) - fair)/fair
+                    s_val = max(-20, min(20, -gap/(gap_pct/100.0) * 20))
+                    raw = s_val
+                    comp = max(0, min(100, (raw + 120) * 100.0 / 240.0))
+                    comp_list.append(comp)
+                    if comp >= 70: pos.append(0.03)
+                    elif comp >= 55: pos.append(0.01)
+                    elif comp >= 45: pos.append(0.00)
+                    elif comp >= 30: pos.append(-0.01)
+                    else: pos.append(-0.03)
+                ret = df["ret"].iloc[REG_WINDOW_M+1:REG_WINDOW_M+1+len(pos)].values
+                strat = (np.array(pos) * ret)
+                sharpe, mdd = sharpe_and_mdd(pd.Series(strat))
+                results.append({"gap_pct":gap_pct,"beta":beta,"alpha":alpha,"sharpe":round(float(sharpe),3),"mdd":round(float(mdd),3),"n":int(len(strat))})
+
+    res_df = pd.DataFrame(results).sort_values(["sharpe","mdd"], ascending=[False, True]).head(20)
+    os.makedirs(".bot_state", exist_ok=True)
+    out = ".bot_state/valuation_grid_top20.csv"
+    res_df.to_csv(out, index=False)
+    print("TOP 20 PARAMS:\n", res_df.to_string(index=False))
+    print("Saved:", out)
+
+if __name__=="__main__":
+    main()
+
+PY
+          python tools/valuation_backtest_grid_v1.py
+
+      - name: Show results
+        run: |
+          ls -la .bot_state || true
+          [ -f .bot_state/valuation_grid_top20.csv ] && tail -n +1 .bot_state/valuation_grid_top20.csv | sed -n '1,200p' || echo "No result file"
+
+      - name: Commit results
+        run: |
+          git config user.email "bot@example.com"
+          git config user.name "backtest-bot"
+          git add -f .bot_state/valuation_grid_top20.csv || true
+          git commit -m "auto: update valuation grid results" || echo "no changes"
+          git push || true
