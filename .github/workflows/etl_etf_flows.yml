@@ -5,11 +5,25 @@ on:
     - cron: "0 1 * * 2-6"   # Tue-Sat 01:00 UTC (~美股收盘后)
   workflow_dispatch:
 
+permissions:
+  contents: write   # 关键：赋予写权限
+
 jobs:
   etl:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config --global user.email "bot@example.com"
+          git config --global user.name "auto-etl-bot"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git remote -v
+          git branch --show-current || true
 
       - uses: actions/setup-python@v5
         with:
@@ -20,22 +34,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pandas lxml html5lib
 
-      - name: Build CSV (SoSoValue first, Farside as fallback)
+      - name: Build CSV (SoSoValue first, Farside fallback)
         env:
-          # SoSoValue（推荐；若已在仓库 Variables 里配置，这里会自动读取）
+          # SoSoValue（建议设为仓库 Variables）
           BTC_ETF_API_URL: ${{ vars.BTC_ETF_API_URL }}
           BTC_ETF_API_METHOD: ${{ vars.BTC_ETF_API_METHOD }}
           BTC_ETF_API_HEADERS: ${{ vars.BTC_ETF_API_HEADERS }}
           BTC_ETF_API_BODY: ${{ vars.BTC_ETF_API_BODY }}
           BTC_ETF_API_DATE_FIELD: ${{ vars.BTC_ETF_API_DATE_FIELD }}
           BTC_ETF_API_FLOW_FIELD: ${{ vars.BTC_ETF_API_FLOW_FIELD }}
-          # Farside（兜底）
+          # Farside（兜底；403 时会走镜像）
           FARSIDE_ALLDATA_URL: ${{ vars.FARSIDE_ALLDATA_URL }}
         run: |
           python - <<'PY'
-          import os, json, requests, pandas as pd, io
-          from datetime import datetime
-
+          import os, json, requests, pandas as pd
           def write_csv(df):
               df = df.copy()
               df.columns = ["Date","NetFlowUSD"]
@@ -57,11 +69,9 @@ jobs:
               if not url:
                   return False, "no-url"
               try:
-                  headers = {"User-Agent":"ETL/1.1"}
-                  try:
-                      headers.update(json.loads(hdrs))
-                  except Exception:
-                      pass
+                  headers = {"User-Agent":"ETL/1.2"}
+                  try: headers.update(json.loads(hdrs))
+                  except: pass
                   if method=="POST":
                       try:
                           j = json.loads(body)
@@ -73,47 +83,34 @@ jobs:
                   r.raise_for_status()
                   jr = r.json()
                   data = jr.get("data", jr)
-                  rows = data.get("list", []) if isinstance(data, dict) else (data if isinstance(data,list) else [])
-                  if not rows:
-                      return False, "no-rows"
+                  rows = data.get("list", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                  if not rows: return False, "no-rows"
                   df = pd.DataFrame(rows)
                   if date_f not in df.columns or flow_f not in df.columns:
-                      # try best-effort mapping
-                      dcol = None
-                      for c in df.columns:
-                          if str(c).lower() in ("date","day","datetime"): dcol = c; break
-                      fcol = None
-                      for c in df.columns:
-                          lc = str(c).lower()
-                          if ("inflow" in lc) or lc.endswith("flow") or lc.endswith("net"):
-                              fcol = c; break
-                      if not dcol or not fcol:
-                          return False, "bad-cols"
+                      dcol = next((c for c in df.columns if str(c).lower() in ("date","day","datetime")), None)
+                      fcol = next((c for c in df.columns if "inflow" in str(c).lower() or str(c).lower().endswith("flow")), None)
+                      if not dcol or not fcol: return False, "bad-cols"
                       date_f, flow_f = dcol, fcol
                   df = df[[date_f, flow_f]].rename(columns={date_f:"Date", flow_f:"NetFlowUSD"})
                   write_csv(df)
                   return True, "sosovalue"
               except requests.HTTPError as e:
-                  return False, f"http {e.response.status_code}"
+                  return False, f"http {e.response.status_code if e.response else 'http'}"
               except Exception as e:
                   return False, f"err {type(e).__name__}"
 
           def try_farside():
               base = os.environ.get("FARSIDE_ALLDATA_URL","https://farside.co.uk/bitcoin-etf-flow-all-data/")
-              headers = {"User-Agent":"ETF-ETL/1.1"}
+              headers = {"User-Agent":"ETF-ETL/1.2"}
               def fetch(u):
                   r = requests.get(u, headers=headers, timeout=30); r.raise_for_status(); return r.text
-              html = None
               try:
                   html = fetch(base)
               except requests.HTTPError as e:
                   if e.response is not None and e.response.status_code==403:
-                      # fallback via read-only proxy mirror
-                      mirror = "https://r.jina.ai/http://farside.co.uk/bitcoin-etf-flow-all-data/"
-                      html = fetch(mirror)
+                      html = fetch("https://r.jina.ai/http://farside.co.uk/bitcoin-etf-flow-all-data/")
                   else:
                       raise
-              import pandas as pd
               tables = pd.read_html(html)
               cand=None; best=0
               for t in tables:
@@ -121,12 +118,9 @@ jobs:
                   df = t.copy()
                   try:
                       pd.to_datetime(df.iloc[:,0], errors="raise")
-                      if len(df)>best:
-                          cand=df; best=len(df)
-                  except Exception:
-                      pass
-              if cand is None:
-                  raise SystemExit("No parseable table from Farside (even mirror)")
+                      if len(df)>best: cand=df; best=len(df)
+                  except: pass
+              if cand is None: raise SystemExit("No parseable table from Farside")
               df = cand[[cand.columns[0], cand.columns[-1]]].copy()
               df.columns = ["Date","NetFlowUSD"]
               write_csv(df)
@@ -141,10 +135,21 @@ jobs:
               if ok: print("[SRC] Farside (direct/mirror)")
           PY
 
-      - name: Commit CSV
+      - name: Show files
         run: |
-          git config user.email "bot@example.com"
-          git config user.name "auto-etl-bot"
-          git add .bot_state/btc_spot_etf_flows.csv || true
-          git commit -m "auto: update ETF flows CSV" || echo "no changes"
-          git push || true
+          ls -la
+          ls -la .bot_state || true
+          git status --porcelain
+          echo "Current branch: $GITHUB_REF_NAME"
+
+      - name: Commit & push CSV
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          # 强制加入（忽略 .gitignore 的影响）
+          git add -f .bot_state/btc_spot_etf_flows.csv
+          if git commit -m "auto: update ETF flows CSV $(date -u +%F)"; then
+            git push origin HEAD:${BRANCH}
+          else
+            echo "No changes to commit"
+          fi
