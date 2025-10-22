@@ -1,0 +1,53 @@
+
+name: Valuation Grid Backtest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas yfinance numpy
+
+      - name: Run grid backtest
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          WGC_CSV_URL: ${{ vars.WGC_CSV_URL }}
+          FRED_GOLD_SERIES_ID: ${{ vars.FRED_GOLD_SERIES_ID }}
+          REG_WINDOW_M: ${{ vars.REG_WINDOW_M }}
+        run: |
+          python tools/valuation_backtest_grid_v1.py
+
+      - name: Show results
+        run: |
+          ls -la .bot_state || true
+          if [ -f .bot_state/valuation_grid_top20.csv ]; then
+            echo "Top 20 parameter sets:"
+            sed -n '1,200p' .bot_state/valuation_grid_top20.csv
+          else
+            echo "No result file (.bot_state/valuation_grid_top20.csv)"
+            exit 1
+          fi
+
+      - name: Commit results
+        run: |
+          git config user.email "bot@example.com"
+          git config user.name "backtest-bot"
+          git add -f .bot_state/valuation_grid_top20.csv || true
+          git commit -m "auto: update valuation grid results" || echo "no changes"
+          git push || true
