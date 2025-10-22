@@ -1,4 +1,4 @@
-name: Valuation Grid Backtest
+name: Valuation Grid Backtest v2
 
 on:
   workflow_dispatch:
@@ -19,9 +19,10 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests pandas yfinance numpy
+  run: |
+    python -m pip install --upgrade pip
+    python -m pip install pandas requests yfinance numpy python-dateutil
+    python tools/valuation_backtest_grid_v2.py
 
       # 预检：确保 WGC_CSV_URL 可访问且看得到前几行
       - name: Preflight WGC_CSV_URL
@@ -42,7 +43,7 @@ jobs:
           # 如你的 WGC 样本不足 25 个月，可先设为 6；补齐后改回 12
           CB_YOY_ROLL_M: ${{ vars.CB_YOY_ROLL_M }}
         run: |
-          python tools/valuation_backtest_grid_v1.py
+          python tools/valuation_backtest_grid_v2.py
 
       - name: Show results
         run: |
