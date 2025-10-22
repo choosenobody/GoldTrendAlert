@@ -102,11 +102,11 @@ def sharpe_and_mdd(ret_m):
 def main():
     gold_d = get_gold_daily()
     assert gold_d is not None and len(gold_d)>300, "Gold series too short"
-    gold_m = gold_d.resample("M").last().dropna()
+    gold_m = gold_d.resample("ME").last().dropna()
 
     tips_d = get_fred_series("DFII10", days=365*12)
     assert tips_d is not None and len(tips_d)>300, "TIPS series too short"
-    tips_m = tips_d.resample("M").mean().dropna()
+    tips_m = tips_d.resample("ME").mean().dropna()
 
     wgc_url = env("WGC_CSV_URL"); assert wgc_url, "Set WGC_CSV_URL"
     r=requests.get(wgc_url, headers=UA, timeout=TIMEOUT); r.raise_for_status()
