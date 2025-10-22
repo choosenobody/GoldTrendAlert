@@ -2,42 +2,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Liquidity & Hedge Weekly Monitor Bot
-# File: liquidity_monitor_bot_v1_0_0.py
+# File: liquidity_monitor_bot_v1_1_1.py
 #
-# Purpose:
-#   - 每周自动抓取关键流动性与风险指标，生成一页版摘要，并通过 Telegram 机器人发送给指定聊天。
-#   - 指标：FOMC信号（需人工备注/可选）、10Y美债名义利率、10Y TIPS真实利率、VIX、BTC永续资金费率。
-#   - 设计为“可运行即用、可拓展”，对数据源不可用时给出 N/A 并不阻断。
-#
-# Usage:
-#   MODE=send python liquidity_monitor_bot_v1_0_0.py           # 发送到 Telegram
-#   MODE=status python liquidity_monitor_bot_v1_0_0.py         # 本地打印，不发送
-#
-# Env (必须/可选):
-#   TELEGRAM_BOT_TOKEN   - Telegram 机器人 Token（必填，建议用 GitHub Secrets）
-#   TELEGRAM_CHAT_ID     - 目标 Chat ID（必填）
-#   FOMC_NOTE            - 可选，手工备注最新FOMC政策信号（如：'9月降息25bp；10月预期再降；或暂停QT'）
-#   BTC_ETF_FLOWS_USD    - 可选，手工录入本周美股现货BTC ETF净流入(USD)，如未知可不填
-#   GOLD_CB_PURCHASE_T   - 可选，手工录入全球央行当月净购金(吨)，如未知可不填
-#
-# Dependencies:
-#   pip install requests pandas yfinance python-dateutil
-#
-# Author: ChatGPT (GPT-5 Thinking)
-# Version: v1.0.0
+# Fixes vs v1_1_0:
+#   - 全面 HTML 安全：所有含有 "<" 或 ">" 的文本均使用 html.escape()
+#   - 表格使用 <pre><code>...</code></pre> 以避免解析错误
+#   - 去除消息体中尖括号示例，引导语用方括号替代
 #
 import os
 import sys
 import html
+import json
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 import requests
 import pandas as pd
 import yfinance as yf
 from dateutil import tz
 
-TIMEOUT = 15  # seconds
-UA = {"User-Agent": "Mozilla/5.0 (LiquidityMonitorBot/1.0)"}
+TIMEOUT = 15
+UA = {"User-Agent": "Mozilla/5.0 (LiquidityMonitorBot/1.1.1)"}
 
 def env(key, default=None):
     v = os.environ.get(key)
@@ -45,12 +29,10 @@ def env(key, default=None):
 
 def now_tz(tzname="Asia/Shanghai"):
     tzinfo = tz.gettz(tzname)
-    return datetime.now(tz=tzinfo)
+    return datetime.now(tz=tzname)
 
-# ------------------------- Data Providers -------------------------
+# ------------------ Market Data ------------------
 def get_yahoo_last_and_wow(symbol, adj_by_ten=False):
-    # 拉取最近14天日线，取最后一个有效数值作为 last，取5个交易日前的数值计算WoW。
-    # adj_by_ten: True时对^TNX做 /10 处理（^TNX=收益率*10）
     try:
         df = yf.download(symbol, period="14d", interval="1d", progress=False, auto_adjust=False)
         if df is None or df.empty:
@@ -70,8 +52,6 @@ def get_yahoo_last_and_wow(symbol, adj_by_ten=False):
         return None, None
 
 def get_treasury_real_10y():
-    # 从美国财政部CSV抓取10Y真实利率（TIPS）。源：Daily Treasury REAL Yield Curve Rates (CSV)
-    # 取最后两个有效值，计算WoW近似（以两个最近工作日替代周频）。
     url = "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-real-yield-curve-rates-csv"
     try:
         r = requests.get(url, headers=UA, timeout=TIMEOUT)
@@ -84,25 +64,24 @@ def get_treasury_real_10y():
     except Exception:
         return None, None
 
-    if "10 Yr" not in df.columns:
+    col = None
+    if "10 Yr" in df.columns:
+        col = "10 Yr"
+    else:
         candidates = [c for c in df.columns if str(c).lower().strip().replace(" ", "") in ("10yr", "10y")]
         if candidates:
             col = candidates[0]
-        else:
-            return None, None
-    else:
-        col = "10 Yr"
+    if not col:
+        return None, None
 
     series = pd.to_numeric(df[col], errors="coerce").dropna()
     if len(series) < 2:
         return None, None
     last = float(series.iloc[-1])
     prev = float(series.iloc[-2])
-    wow = last - prev
-    return round(last, 4), round(wow, 4)
+    return round(last, 4), round(last - prev, 4)
 
 def get_binance_btc_funding():
-    # 获取币安BTCUSDT永续合约资金费率与下次结算时间。
     url = "https://fapi.binance.com/fapi/v1/premiumIndex"
     try:
         r = requests.get(url, params={"symbol": "BTCUSDT"}, headers=UA, timeout=TIMEOUT)
@@ -115,21 +94,187 @@ def get_binance_btc_funding():
     except Exception:
         return None, None, None
 
-# ------------------------- Helpers -------------------------
+# ------------------ ETF Flows (auto) ------------------
+def week_range_shanghai(now_dt):
+    dow = now_dt.weekday()  # Monday=0
+    monday = now_dt - timedelta(days=dow)
+    monday = monday.replace(hour=0, minute=0, second=0, microsecond=0)
+    friday = monday + timedelta(days=4, hours=23, minutes=59, seconds=59)
+    return monday.date(), friday.date()
+
+def parse_etf_flows_from_csv(csv_path, now_dt):
+    try:
+        if not os.path.exists(csv_path):
+            return None, "CSV not found"
+        df = pd.read_csv(csv_path)
+        # date column
+        date_col = None
+        for c in df.columns:
+            if str(c).lower() in ("date", "day", "datetime", "month", "period"):
+                date_col = c; break
+        if date_col is None:
+            for c in df.columns:
+                try:
+                    pd.to_datetime(df[c], errors="raise")
+                    date_col = c; break
+                except Exception:
+                    continue
+        if date_col is None:
+            return None, "No date column"
+        # flow column
+        flow_col = None
+        for cand in ("FlowUSD", "NetFlowUSD", "net_flow_usd", "netflow_usd", "netflow", "flow_usd", "flow", "net"):
+            for c in df.columns:
+                if str(c).lower() == cand.lower():
+                    flow_col = c; break
+            if flow_col: break
+        if flow_col is None:
+            num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            if len(num_cols) == 1:
+                flow_col = num_cols[0]
+            else:
+                return None, "No flow column"
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce").dt.date
+        df = df.dropna(subset=[date_col])
+        week_start, week_end = week_range_shanghai(now_dt)
+        mask = (df[date_col] >= week_start) & (df[date_col] <= week_end)
+        weekly_sum = pd.to_numeric(df.loc[mask, flow_col], errors="coerce").sum()
+        return float(weekly_sum), "CSV"
+    except Exception as e:
+        return None, f"CSV error: {e}"
+
+def parse_etf_flows_from_api(api_url, now_dt):
+    try:
+        if not api_url:
+            return None, "No API URL"
+        r = requests.get(api_url, headers=UA, timeout=TIMEOUT)
+        r.raise_for_status()
+        j = r.json()
+        rows = j["data"] if isinstance(j, dict) and isinstance(j.get("data"), list) else (j if isinstance(j, list) else [])
+        weekly_sum = 0.0
+        week_start, week_end = week_range_shanghai(now_dt)
+        for row in rows:
+            d = None
+            for k in ("date", "day", "datetime", "ts", "time"):
+                if k in row:
+                    try:
+                        if k in ("ts", "time") and isinstance(row[k], (int, float)):
+                            d = datetime.utcfromtimestamp(int(row[k])//1000 if int(row[k])>1e12 else int(row[k])).date()
+                        else:
+                            d = pd.to_datetime(row[k], errors="coerce").date()
+                    except Exception:
+                        d = None
+                    if d: break
+            if not d or not (week_start <= d <= week_end):
+                continue
+            flow = None
+            for k in ("net_flow_usd", "netflow_usd", "net_flow", "netflow", "flow_usd", "flow", "net"):
+                if k in row:
+                    try:
+                        flow = float(row[k])
+                    except Exception:
+                        flow = None
+                    break
+            if flow is None:
+                continue
+            weekly_sum += flow
+        return float(weekly_sum), "API"
+    except Exception as e:
+        return None, f"API error: {e}"
+
+def get_weekly_btc_etf_flows(now_dt):
+    manual = env("BTC_ETF_FLOWS_USD")
+    if manual is not None:
+        try:
+            return float(manual), "Manual"
+        except Exception:
+            return None, "Manual parse error"
+    csv_path = env("BTC_ETF_FLOWS_CSV_PATH", "btc_spot_etf_flows.csv")
+    v, src = parse_etf_flows_from_csv(csv_path, now_dt)
+    if v is not None:
+        return v, src
+    api_url = env("BTC_ETF_API_URL")
+    v, src = parse_etf_flows_from_api(api_url, now_dt)
+    if v is not None:
+        return v, src
+    return None, "N/A"
+
+# ------------------ Central Bank Gold Purchases (auto) ------------------
+def load_wgc_latest_net_buy_tons(csv_path):
+    try:
+        if not os.path.exists(csv_path):
+            return None, "CSV not found"
+        df = pd.read_csv(csv_path)
+        date_col = None
+        for c in df.columns:
+            cl = str(c).strip().lower()
+            if cl in ("month", "date", "period"):
+                date_col = c; break
+        if date_col is None:
+            for c in df.columns:
+                try:
+                    pd.to_datetime(df[c], errors="raise")
+                    date_col = c; break
+                except Exception:
+                    continue
+        if date_col is None:
+            return None, "No date column"
+        val_col = None
+        candidates = ["netpurchasetons", "net_purchase_tons", "net", "nettons", "netcentralbankpurchases", "cb_net_buy_tons"]
+        lower_map = {str(c).lower().replace(" ", ""): c for c in df.columns}
+        for name in candidates:
+            if name in lower_map:
+                val_col = lower_map[name]; break
+        if val_col is None:
+            num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            if num_cols:
+                val_col = num_cols[0]
+            else:
+                return None, "No numeric column"
+        dates = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.loc[~dates.isna()].copy()
+        df["__dt"] = dates
+        df = df.sort_values("__dt")
+        latest = df.iloc[-1]
+        val = float(latest[val_col])
+        return val, "CSV(WGC)"
+    except Exception as e:
+        return None, f"CSV error: {e}"
+
+def get_central_bank_net_buy_tons():
+    manual = env("GOLD_CB_PURCHASE_T")
+    if manual is not None:
+        try:
+            return float(manual), "Manual"
+        except Exception:
+            return None, "Manual parse error"
+    csv_path = env("WGC_CSV_PATH", "wgc_netbuy.csv")
+    v, src = load_wgc_latest_net_buy_tons(csv_path)
+    if v is not None:
+        return v, src
+    return None, "N/A"
+
+# ------------------ Helpers ------------------
 def pct_str(v):
     try:
         return f"{float(v)*100:.2f}%"
     except Exception:
         return "N/A"
 
-# ------------------------- Decision Heuristics -------------------------
+def number_with_sign(v):
+    try:
+        f = float(v)
+        s = f"{f:,.0f}"
+        return s if f < 0 else "+" + s
+    except Exception:
+        return "N/A"
+
+# ------------------ Decision Heuristics ------------------
 def infer_tldr_and_actions(data):
-    # 依据阈值生成 TL;DR 与操作倾向。
     tnx, tips, vix, fr = data.get("tnx"), data.get("tips"), data.get("vix"), data.get("fund_rate")
     tips_wow, vix_wow = data.get("tips_wow"), data.get("vix_wow")
 
     bullets = []
-
     if (tips is not None and tips_wow is not None and tips_wow < 0) and (vix is not None and vix < 20):
         bullets.append("🟢 流动性边际改善（真实利率下行 + 波动温和）")
     elif vix is not None and vix >= 25:
@@ -154,7 +299,7 @@ def infer_tldr_and_actions(data):
     tldr = "；".join(bullets)
     return tldr, gold_view, btc_view
 
-# ------------------------- Telegram -------------------------
+# ------------------ Telegram ------------------
 def send_telegram(token, chat_id, text, parse_mode="HTML", disable_web_page_preview=True):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
@@ -167,7 +312,7 @@ def send_telegram(token, chat_id, text, parse_mode="HTML", disable_web_page_prev
     ok = r.status_code == 200 and r.json().get("ok") is True
     return ok, (r.text if not ok else "ok")
 
-# ------------------------- Main -------------------------
+# ------------------ Main ------------------
 def main():
     mode = (env("MODE", "send") or "send").strip().lower()
     token = env("TELEGRAM_BOT_TOKEN")
@@ -176,16 +321,18 @@ def main():
         print("[ERROR] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 未配置；若仅测试请使用 MODE=status")
         sys.exit(2)
 
-    # 拉数据
-    tnx, tnx_wow = get_yahoo_last_and_wow("^TNX", adj_by_ten=True)     # 10Y nominal
-    vix, vix_wow = get_yahoo_last_and_wow("^VIX", adj_by_ten=False)    # VIX
-    tips, tips_wow = get_treasury_real_10y()                            # 10Y real
-    fr, next_ts, mark_px = get_binance_btc_funding()                    # Funding rate
+    # Markets
+    tnx, tnx_wow = get_yahoo_last_and_wow("^TNX", adj_by_ten=True)
+    vix, vix_wow = get_yahoo_last_and_wow("^VIX", adj_by_ten=False)
+    tips, tips_wow = get_treasury_real_10y()
+    fr, next_ts, mark_px = get_binance_btc_funding()
 
-    # 可选外部补充
-    fomc_note = env("FOMC_NOTE", "（手工）关注FOMC：降息节奏与QT是否暂停")
-    etf_flows = env("BTC_ETF_FLOWS_USD", "N/A")
-    gold_cb = env("GOLD_CB_PURCHASE_T", "N/A")
+    # ETF flows (auto)
+    now_local = now_tz("Asia/Shanghai")
+    etf_weekly, etf_src = get_weekly_btc_etf_flows(now_local)
+
+    # Central bank purchases (auto)
+    cb_tons, cb_src = get_central_bank_net_buy_tons()
 
     data = {
         "tnx": tnx, "tnx_wow": tnx_wow,
@@ -195,8 +342,7 @@ def main():
     }
     tldr, gold_view, btc_view = infer_tldr_and_actions(data)
 
-    sh_now = now_tz("Asia/Shanghai")
-    ts_str = sh_now.strftime("%Y-%m-%d %H:%M %Z")
+    ts_str = now_local.strftime("%Y-%m-%d %H:%M %Z")
 
     def fmt(v, digits=4):
         return "N/A" if v is None else f"{v:.{digits}f}"
@@ -206,13 +352,12 @@ def main():
         ("10Y真实(%)", fmt(tips, 3), fmt(tips_wow, 3), "UST Real Yields CSV"),
         ("VIX",        fmt(vix, 2),  fmt(vix_wow, 2),  "Yahoo ^VIX"),
         ("BTC资金费率", "N/A" if fr is None else pct_str(fr), "—", "Binance Perp Funding"),
-        ("BTC ETF净流(周)", str(etf_flows), "—", "手工/数据源见注"),
-        ("央行净购金(吨,月)", str(gold_cb), "—", "WGC月度/手工填"),
+        ("BTC ETF净流(周)", "N/A" if etf_weekly is None else number_with_sign(etf_weekly), "—", etf_src),
+        ("央行净购金(吨,月)", "N/A" if cb_tons is None else f"{cb_tons:.1f}", "—", cb_src),
     ]
     w1 = max(len(r[0]) for r in rows)
     w2 = max(len(str(r[1])) for r in rows)
     w3 = max(len(str(r[2])) for r in rows)
-    w4 = max(len(str(r[3])) for r in rows)
     header = f"{'指标'.ljust(w1)}  {'最新'.ljust(w2)}  {'WoW'.ljust(w3)}  来源"
     sep = "-" * len(header)
     table_lines = [header, sep] + [
@@ -221,20 +366,25 @@ def main():
     ]
     table_text = "\n".join(table_lines)
 
+    # 预警前缀
+    prefix = ""
+    if (vix is not None and vix >= 25) or (tips is not None and tips_wow is not None and tips_wow > 0.15):
+        prefix = "⚠️预警 "
+
     msg = []
-    msg.append(f"📊 <b>每周流动性与对冲监控</b>  •  {ts_str}")
+    msg.append(f"{prefix}📊 <b>每周流动性与对冲监控</b>  •  {html.escape(ts_str)}")
     msg.append("")
     msg.append(f"<b>TL;DR</b>：{html.escape(tldr)}")
     msg.append(f"• <b>黄金</b>：{html.escape(gold_view)}")
     msg.append(f"• <b>比特币</b>：{html.escape(btc_view)}")
     msg.append("")
     msg.append("<b>数据小表</b>：")
-    msg.append(f"<pre>{html.escape(table_text)}</pre>")
+    msg.append(f"<pre><code>{html.escape(table_text)}</code></pre>")
     msg.append("")
-    msg.append("<b>门槛/阈值</b>：VIX > 25 预警；VIX < 18 安稳；10Y TIPS 周降看多金；资金费率中性转正利于BTC。")
+    msg.append(html.escape("门槛/阈值：VIX > 25 预警；VIX < 18 安稳；10Y TIPS 周降看多金；资金费率中性转正利于BTC。"))
     msg.append("")
-    msg.append("<b>信息源</b>：Yahoo Finance (^TNX,^VIX), UST Real Yield CSV, Binance Perp Funding；ETF与央行购金建议人工校验/补充。")
-    msg.append("（若任何项为 N/A，属数据源限制或当天无更新，不影响总体推送；可用环境变量手工覆盖。）")
+    msg.append(html.escape("配置提示：可通过 Secrets 设定 [BTC_ETF_FLOWS_USD / BTC_ETF_FLOWS_CSV_PATH / BTC_ETF_API_URL / WGC_CSV_PATH / GOLD_CB_PURCHASE_T]。"))
+    msg.append(html.escape("API 示例：将 `BTC_ETF_API_URL` 指向你自建的 JSON 接口（不要使用尖括号 <> ）。"))
 
     full_msg = "\n".join(msg)
 
@@ -246,7 +396,6 @@ def main():
     if not ok:
         print("[ERROR] 发送Telegram失败：", detail)
         return 3
-
     print("[OK] 已发送Telegram消息。")
     return 0
 
