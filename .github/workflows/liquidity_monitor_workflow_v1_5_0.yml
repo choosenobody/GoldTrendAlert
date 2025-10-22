@@ -1,5 +1,4 @@
-
-name: Liquidity Monitor Bot v1.5.0
+name: Liquidity Monitor Bot v1.5.1
 
 on:
   schedule:
@@ -50,4 +49,4 @@ jobs:
           MODE: send
         run: |
           export GOLD_FAIR_BASE="${GOLD_FAIR_BASE:-REG}"
-          python liquidity_monitor_bot_v1_5_0.py
+          python liquidity_monitor_bot_v1_5_1.py
