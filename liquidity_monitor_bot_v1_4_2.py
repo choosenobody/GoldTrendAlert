@@ -1,14 +1,15 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Liquidity & Hedge Weekly Monitor Bot + Scoring & Position
-# File: liquidity_monitor_bot_v1_4_1.py
+# Version: v1.4.2
 #
-# New in v1_4_1:
-#   - BTC_ETF_API_METHOD 支持 GET/POST（SoSoValue 需要 POST）
-#   - BTC_ETF_API_HEADERS（JSON）、BTC_ETF_API_BODY（JSON）支持
-#   - 自动识别 SoSoValue 响应结构（data.list[].date + totalNetInflow）
-#   - GOLD_FAIR_BASE 支持 "AUTO"：用近3年 XAUUSD=X 的 252日 EWMA 作为基准
+# 修复&增强：
+#  - 修掉 f-string 里包含 '\n' 的语法问题
+#  - GOLD 基准多源兜底（Stooq → FRED → Yahoo GC=F → XAUUSD=X）
+#  - FRED 黄金系列可通过变量 FRED_GOLD_SERIES_ID 指定（默认 GOLDPMGBD228NLBM，自动回退 AM）
+#  - GOLD_FAIR_BASE=AUTO 拿不到序列时安全退回 3500（不再 float("AUTO") 报错）
+#  - pandas FutureWarning 规避（使用 .item() 取标量）
+#  - SoSoValue 历史净流支持 POST+Headers+Body，周净流与趋势分一并计算
 #
 import os, sys, html, traceback, io, json, math
 from datetime import datetime, timedelta
@@ -18,7 +19,7 @@ import yfinance as yf
 from dateutil import tz
 
 TIMEOUT = 25
-UA = {"User-Agent":"Mozilla/5.0 (LiquidityMonitorBot/1.4.1)"}
+UA = {"User-Agent":"Mozilla/5.0 (LiquidityMonitorBot/1.4.2)"}
 
 def env(key, default=None):
     v = os.environ.get(key)
@@ -34,12 +35,26 @@ def clamp(x, a, b): return max(a, min(b, x))
 def get_yahoo_last_and_wow(symbol, adj_by_ten=False):
     try:
         df = yf.download(symbol, period="14d", interval="1d", progress=False, auto_adjust=False)
-        if df is None or df.empty: return None, None
+        if df is None or df.empty:
+            return None, None
         s = df["Close"].dropna()
-        if len(s) < 2: return None, None
-        last = float(s.iloc[-1]); base=float(s.iloc[max(0,len(s)-6)])
-        if adj_by_ten: last/=10.0; base/=10.0
-        return round(last,4), round(last-base,4)
+        if len(s) < 2:
+            return None, None
+        # 用 item() 取标量，避免 FutureWarning
+        try:
+            last_scalar = pd.to_numeric(s.iloc[-1]).item()
+        except Exception:
+            last_scalar = float(s.iloc[-1])
+        try:
+            base_scalar = pd.to_numeric(s.iloc[max(0, len(s)-6)]).item()
+        except Exception:
+            base_scalar = float(s.iloc[max(0, len(s)-6)])
+        last = float(last_scalar)
+        base = float(base_scalar)
+        if adj_by_ten:
+            last /= 10.0
+            base /= 10.0
+        return round(last, 4), round(last - base, 4)
     except Exception:
         return None, None
 
@@ -83,7 +98,6 @@ def get_tips():
 def get_dxy_change(days=30):
     last, _, src = get_from_fred("DTWEXBGS", days=days+60)
     if last is None: return None, None, src
-    # fetch longer range to compute pct
     api_key=env("FRED_API_KEY")
     url="https://api.stlouisfed.org/fred/series/observations"
     params={"series_id":"DTWEXBGS","api_key":api_key,"file_type":"json",
@@ -120,7 +134,6 @@ def etf_from_csv_url(url):
     if not url: return None, "No CSV URL"
     try:
         r=requests.get(url, headers=UA, timeout=TIMEOUT); r.raise_for_status()
-        import io
         df=pd.read_csv(io.StringIO(r.text))
         col_date=None
         for c in df.columns:
@@ -136,22 +149,23 @@ def etf_from_csv_url(url):
         return None, f"CSV(url) error:{e.__class__.__name__}"
 
 def etf_from_api():
-    url = os.environ.get("BTC_ETF_API_URL")
+    url = env("BTC_ETF_API_URL")
     if not url: return None, "No API URL"
-    method = (os.environ.get("BTC_ETF_API_METHOD","GET") or "GET").upper()
+    method = (env("BTC_ETF_API_METHOD","GET") or "GET").upper()
     headers = UA.copy()
-    hdr_json = os.environ.get("BTC_ETF_API_HEADERS")
+    hdr_json = env("BTC_ETF_API_HEADERS")
     if hdr_json:
         try: headers.update(json.loads(hdr_json))
         except: pass
     body_json = None
-    body = os.environ.get("BTC_ETF_API_BODY")
+    body = env("BTC_ETF_API_BODY")
     if body:
         try: body_json = json.loads(body)
         except: body_json = body
     try:
         if method == "POST":
-            r = requests.post(url, headers=headers, json=body_json if isinstance(body_json, dict) else None, data=None if isinstance(body_json, dict) else body_json, timeout=TIMEOUT)
+            r = requests.post(url, headers=headers, json=body_json if isinstance(body_json, dict) else None,
+                              data=None if isinstance(body_json, dict) else body_json, timeout=TIMEOUT)
         else:
             r = requests.get(url, headers=headers, timeout=TIMEOUT)
         r.raise_for_status()
@@ -164,15 +178,16 @@ def etf_from_api():
             rows = data
         if not rows: return None, "API no rows"
         df = pd.DataFrame(rows)
-        date_field = os.environ.get("BTC_ETF_API_DATE_FIELD","date")
-        flow_field = os.environ.get("BTC_ETF_API_FLOW_FIELD","totalNetInflow")
+        date_field = env("BTC_ETF_API_DATE_FIELD","date")
+        flow_field = env("BTC_ETF_API_FLOW_FIELD","totalNetInflow")
         if date_field not in df.columns or flow_field not in df.columns:
             dcol=None
             for c in df.columns:
                 if str(c).lower() in ("date","day","datetime"): dcol=c; break
             fcol=None
             for c in df.columns:
-                if "inflow" in str(c).lower() or "flow" in str(c).lower():
+                lc=str(c).lower()
+                if ("inflow" in lc) or lc.endswith("flow") or lc.endswith("net"):
                     fcol=c; break
             if not dcol or not fcol: return None, "API columns missing"
             date_field, flow_field = dcol, fcol
@@ -183,11 +198,12 @@ def etf_from_api():
         return None, f"API error:{e.__class__.__name__}"
 
 def get_weekly_btc_etf_flows():
-    v, src = etf_from_csv_url(os.environ.get("BTC_ETF_FLOWS_CSV_URL"))
+    v, src = etf_from_csv_url(env("BTC_ETF_FLOWS_CSV_URL"))
     if v is not None: return v, src
     v, src = etf_from_api()
     if v is not None: return v, src
-    url = os.environ.get("FARSIDE_ALLDATA_URL","https://farside.co.uk/bitcoin-etf-flow-all-data/")
+    # fallback Farside (HTML 表格)
+    url = env("FARSIDE_ALLDATA_URL","https://farside.co.uk/bitcoin-etf-flow-all-data/")
     try:
         r=requests.get(url, headers=UA, timeout=TIMEOUT); r.raise_for_status()
         tables=pd.read_html(r.text)
@@ -206,28 +222,86 @@ def get_weekly_btc_etf_flows():
     except Exception as e:
         return None, f"Farside(error:{e.__class__.__name__})"
 
-# ---------- Valuation ----------
-def get_xau_spot_and_base():
+# ---------- GOLD price (multi-source) ----------
+def get_stooq_xau_series():
     try:
-        df=yf.download("XAUUSD=X", period="5y", interval="1d", progress=False, auto_adjust=False)
-        s=df["Close"].dropna()
-        spot=float(s.iloc[-1])
-        base_cfg=os.environ.get("GOLD_FAIR_BASE","3500")
-        if str(base_cfg).upper()=="AUTO":
-            ewma=s.ewm(span=252, adjust=False).mean().iloc[-1]
-            base=float(ewma)
-        else:
-            base=float(base_cfg)
-        return spot, base
+        url = "https://stooq.com/q/d/l/?s=xauusd&i=d"
+        r = requests.get(url, headers=UA, timeout=TIMEOUT); r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date", "Close"]).sort_values("Date")
+        s = pd.to_numeric(df["Close"], errors="coerce").dropna()
+        return s if len(s)>0 else None
     except Exception:
-        return None, float(os.environ.get("GOLD_FAIR_BASE","3500") or 3500.0)
+        return None
 
+def get_fred_gold_series(days=5*365):
+    api_key = env("FRED_API_KEY")
+    if not api_key: return None
+    url = "https://api.stlouisfed.org/fred/series/observations"
+    prefer = env("FRED_GOLD_SERIES_ID", "GOLDPMGBD228NLBM")
+    series_ids = [prefer, "GOLDAMGBD228NLBM"] if prefer != "GOLDAMGBD228NLBM" else [prefer, "GOLDPMGBD228NLBM"]
+    for sid in series_ids:
+        params = {"series_id": sid,"api_key": api_key,"file_type":"json",
+                  "observation_start": (datetime.utcnow()-timedelta(days=days)).strftime("%Y-%m-%d")}
+        try:
+            r = requests.get(url, params=params, headers=UA, timeout=TIMEOUT); r.raise_for_status()
+            obs = r.json().get("observations", [])
+            vals = [float(o["value"]) for o in obs if o.get("value") not in (".", None)]
+            if len(vals)==0: 
+                continue
+            return pd.Series(vals)
+        except Exception:
+            continue
+    return None
+
+def get_xau_spot_and_base():
+    s = get_stooq_xau_series()
+    if s is None:
+        s = get_fred_gold_series(days=5*365)
+    if s is None:
+        try:
+            df = yf.download("GC=F", period="5y", interval="1d", progress=False, auto_adjust=False)
+            if df is not None and not df.empty:
+                s = df["Close"].dropna()
+        except Exception:
+            s = None
+    if s is None:
+        try:
+            df = yf.download("XAUUSD=X", period="5y", interval="1d", progress=False, auto_adjust=False)
+            if df is not None and not df.empty:
+                s = df["Close"].dropna()
+        except Exception:
+            s = None
+
+    base_cfg = env("GOLD_FAIR_BASE", "AUTO")
+
+    if s is None or len(s)==0:
+        spot = None
+        base = 3500.0 if str(base_cfg).upper()=="AUTO" else float(base_cfg)
+        return spot, base
+
+    try:
+        spot = float(pd.to_numeric(s.iloc[-1]).item())
+    except Exception:
+        spot = float(s.iloc[-1])
+
+    if str(base_cfg).upper()=="AUTO":
+        try:
+            base = float(s.ewm(span=252, adjust=False).mean().iloc[-1])
+        except Exception:
+            base = 3500.0
+    else:
+        base = float(base_cfg)
+
+    return spot, base
+
+# ---------- WGC / Valuation ----------
 def cb_yoy_pct_from_wgc():
     try:
-        url=os.environ.get("WGC_CSV_URL")
+        url=env("WGC_CSV_URL")
         if not url: return None, "WGC N/A"
         r=requests.get(url, headers=UA, timeout=TIMEOUT); r.raise_for_status()
-        import io
         df=pd.read_csv(io.StringIO(r.text))
         dcol=None
         for c in df.columns:
@@ -260,17 +334,18 @@ def cb_yoy_pct_from_wgc():
 
 def valuation_gap_score(xau_spot, base, tips, cb_yoy_pct):
     try:
-        beta=float(os.environ.get("BETA_TIPS","0.3"))
-        alpha=float(os.environ.get("ALPHA_CB","0.02"))
+        beta=float(env("BETA_TIPS","0.3"))
+        alpha=float(env("ALPHA_CB","0.02"))
         if None in (xau_spot, base, tips, cb_yoy_pct):
             return 0, "估值缺数据"
         fair = base + beta * (0 - float(tips)) + alpha * float(cb_yoy_pct) * base
         gap=(xau_spot - fair)/fair
-        score = clamp(-gap/0.10 * 20, -20, +20)
+        score = clamp(-gap/0.10 * 20, -20, +20)  # ±10% → ∓20分
         return round(score,1), f"base={round(base,1)}, fair={round(fair,1)}, gap={round(gap*100,2)}%"
     except Exception:
         return 0, "估值异常"
 
+# ---------- Auctions ----------
 def auctions_quality_score(look_back_days=75):
     base="https://api.fiscaldata.treasury.gov/services/api/fiscal_service"
     endpoints=["v1/accounting/od/auctions_query","v1/accounting/od/auction_result"]
@@ -303,30 +378,36 @@ def auctions_quality_score(look_back_days=75):
     score=clamp(delta/0.05 * 10, -25, 25)
     return round(score,1), f"{endp} ΔBTC={round(delta,3)}"
 
+# ---------- ETF series & scoring ----------
 def etf_daily_series():
-    url=os.environ.get("BTC_ETF_API_URL")
-    if url and (os.environ.get("BTC_ETF_API_METHOD","GET").upper()=="POST"):
+    url=env("BTC_ETF_API_URL")
+    if url and (env("BTC_ETF_API_METHOD","GET").upper()=="POST"):
         headers=UA.copy()
-        hdr=os.environ.get("BTC_ETF_API_HEADERS")
+        hdr=env("BTC_ETF_API_HEADERS")
         if hdr:
             try: headers.update(json.loads(hdr))
             except: pass
-        body=os.environ.get("BTC_ETF_API_BODY","{}")
+        body=env("BTC_ETF_API_BODY","{}")
         try: jbody=json.loads(body)
         except: jbody={"type":"us-btc-spot"}
         try:
             r=requests.post(url, headers=headers, json=jbody, timeout=TIMEOUT); r.raise_for_status()
             j=r.json(); data=j.get("data",{}); rows=data.get("list",[])
             if rows:
-                df=pd.DataFrame(rows)[["date","totalNetInflow"]]
-                df["Date"]=pd.to_datetime(df["date"], errors="coerce")
-                df["NetFlowUSD"]=pd.to_numeric(df["totalNetInflow"], errors="coerce")
-                return df.dropna(subset=["Date","NetFlowUSD"])[["Date","NetFlowUSD"]].sort_values("Date")
+                df=pd.DataFrame(rows)
+                # 字段可能叫 date / totalNetInflow
+                dcol = "date" if "date" in df.columns else next((c for c in df.columns if str(c).lower() in ("date","day","datetime")), None)
+                fcol = "totalNetInflow" if "totalNetInflow" in df.columns else next((c for c in df.columns if "inflow" in str(c).lower() or str(c).lower().endswith("flow")), None)
+                if dcol and fcol:
+                    df=df[[dcol,fcol]].rename(columns={dcol:"Date", fcol:"NetFlowUSD"})
+                    df["Date"]=pd.to_datetime(df["Date"], errors="coerce")
+                    df["NetFlowUSD"]=pd.to_numeric(df["NetFlowUSD"], errors="coerce")
+                    return df.dropna(subset=["Date","NetFlowUSD"]).sort_values("Date")
         except Exception:
             pass
     # fallback Farside
     try:
-        url = os.environ.get("FARSIDE_ALLDATA_URL","https://farside.co.uk/bitcoin-etf-flow-all-data/")
+        url = env("FARSIDE_ALLDATA_URL","https://farside.co.uk/bitcoin-etf-flow-all-data/")
         r=requests.get(url, headers=UA, timeout=TIMEOUT); r.raise_for_status()
         tables=pd.read_html(r.text)
         cand=None; best=0
@@ -355,40 +436,46 @@ def etf_score_from_series(df, short=21, long=63):
     bullish = (ema_s.iloc[-1] > ema_l.iloc[-1]) and (slope > 0)
     mad = (s - s.rolling(63).median()).abs().rolling(63).median().iloc[-1]
     norm = 0 if (pd.isna(mad) or mad==0) else slope / mad
-    raw = max(-1.5, min(1.5, norm)) * 20
-    score = max(-20, min(20, raw))
+    raw = clamp(norm, -1.5, 1.5) * 20
+    score = clamp(raw, -20, +20)
     if bullish: score = min(20, score + 5)
     elif (ema_s.iloc[-1] < ema_l.iloc[-1]) and (slope < 0): score = max(-20, score - 5)
     return round(float(score),1), f"EMA{short}/{long}, slope5={round(float(slope),1)}"
 
+# ---------- Main ----------
 def main():
-    mode=(os.environ.get("MODE","send") or "send").strip().lower()
-    token, chat_id = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+    mode=(env("MODE","send") or "send").strip().lower()
+    token, chat_id = env("TELEGRAM_BOT_TOKEN"), env("TELEGRAM_CHAT_ID")
     if mode=="send" and (not token or not chat_id):
         print("[ERROR] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 未配置；若仅测试请使用 MODE=status"); sys.exit(2)
 
+    # Market snapshots
     tnx, tnx_wow = get_yahoo_last_and_wow("^TNX", adj_by_ten=True)
     vix, vix_wow = get_yahoo_last_and_wow("^VIX", adj_by_ten=False)
     tips, tips_wow, tips_src = get_tips()
-    dxy, dxy_30d_pct, dxy_src = get_dxy_change(days=int(os.environ.get("DXY_LOOKBACK_D","30")))
+    dxy, dxy_30d_pct, dxy_src = get_dxy_change(days=int(env("DXY_LOOKBACK_D","30")))
 
+    # ETF flows & trend score
     etf_weekly, etf_src = get_weekly_btc_etf_flows()
     etf_df = etf_daily_series()
-    etf_score, etf_note = (0,"ETF不可用") if etf_df is None else etf_score_from_series(etf_df, short=int(os.environ.get("ETF_SHORT_D","21")), long=int(os.environ.get("ETF_LONG_D","63")))
+    etf_score, etf_note = (0,"ETF不可用") if etf_df is None else etf_score_from_series(etf_df, short=int(env("ETF_SHORT_D","21")), long=int(env("ETF_LONG_D","63")))
 
-    auc_score, auc_note = auctions_quality_score(look_back_days=int(os.environ.get("AUCTION_WINDOW_D","75")))
+    # Auctions
+    auc_score, auc_note = auctions_quality_score(look_back_days=int(env("AUCTION_WINDOW_D","75")))
 
+    # Valuation
     xau_spot, base = get_xau_spot_and_base()
     cb_yoy, cb_note = cb_yoy_pct_from_wgc()
     val_score, val_note = valuation_gap_score(xau_spot, base, tips, cb_yoy)
 
-    s_tips = 0 if (tips is None or tips_wow is None) else max(-40, min(40, -tips_wow/0.10 * 10))
-    s_dxy  = 0 if (dxy_30d_pct is None) else max(-15, min(15, -dxy_30d_pct/1.5 * 5))
+    # Scoring combine
+    s_tips = 0 if (tips is None or tips_wow is None) else clamp(-tips_wow/0.10 * 10, -40, 40)
+    s_dxy  = 0 if (dxy_30d_pct is None) else clamp(-dxy_30d_pct/1.5 * 5, -15, 15)
     s_etf  = etf_score
     s_auc  = auc_score
     s_val  = val_score
     raw = s_tips + s_dxy + s_etf + s_auc + s_val
-    comp = max(0, min(100, (raw + 120) * 100.0 / 240.0))
+    comp = clamp((raw + 120) * 100.0 / 240.0, 0, 100)
     if comp >= 70: view="【偏多持有】保留核心仓位，逢回加一点。"; pos_delta="+3%"
     elif comp >= 55: view="【中性偏多】耐心持有，节奏为先。"; pos_delta="+1%"
     elif comp >= 45: view="【中性】观望，等待信号共振。"; pos_delta="0%"
@@ -399,13 +486,13 @@ def main():
     def fmt(v,d=4): return "N/A" if v is None else f"{float(v):.{d}f}"
     lines=[]
     lines.append(f"盘中快评 / 状态查询  {html.escape(ts_str)}")
-    lines.append(f"• LBMA Gold PM 近似（USD/oz）≈ ${fmt(xau_spot,2)}  （Yahoo·XAUUSD=X）")
+    lines.append(f"• LBMA Gold PM 近似（USD/oz）≈ ${fmt(xau_spot,2)}  （多源：Stooq/FRED/Yahoo）")
     lines.append("")
     lines.append("信号与评分（单项：TIPS±40，DXY±15，ETF±20，拍卖±25，估值±20）")
     lines.append(f"1）10Y 实际利率 DFII10：{fmt(tips,3)}（WoW {fmt(tips_wow,3)}，{tips_src}） → {round(s_tips,1)}")
-    lines.append(f"2）美元指数（广义）{os.environ.get('DXY_LOOKBACK_D','30')}日变动：{fmt(dxy,2)}（{('+' if (dxy_30d_pct or 0)>=0 else '')}{'N/A' if dxy_30d_pct is None else f'{float(dxy_30d_pct):.2f}%'}；{dxy_src}） → {round(s_dxy,1)}")
+    lines.append(f"2）美元指数（广义）{env('DXY_LOOKBACK_D','30')}日变动：{fmt(dxy,2)}（{('+' if (dxy_30d_pct or 0)>=0 else '')}{'N/A' if dxy_30d_pct is None else f'{float(dxy_30d_pct):.2f}%'}；{dxy_src}） → {round(s_dxy,1)}")
     lines.append(f"3）ETF 净流向代理（21/63 日均线＋斜率）：{etf_note} → {round(s_etf,1)}")
-    lines.append(f"4）美债拍卖质量（近{os.environ.get('AUCTION_WINDOW_D','75')}天 vs 近年 Bid-to-Cover）：{auc_note} → {round(s_auc,1)}")
+    lines.append(f"4）美债拍卖质量（近{env('AUCTION_WINDOW_D','75')}天 vs 近年 Bid-to-Cover）：{auc_note} → {round(s_auc,1)}")
     lines.append(f"5）估值偏离（Valuation）：{val_note} → {round(s_val,1)}")
     lines.append("")
     lines.append(f"综合分（0–100）：{int(round(comp,0))}  （原始分 {int(round(raw,0))} 映射：(raw+120)×100/240；中性=50）")
@@ -420,7 +507,7 @@ def main():
         ("VIX", fmt(vix,2), fmt(vix_wow,2), "Yahoo ^VIX"),
         ("BTC ETF净流(周)", "N/A" if etf_weekly is None else f"{float(etf_weekly):,.0f}", "—", etf_src),
         ("央行购金YoY(%)", "N/A" if cb_yoy is None else f"{float(cb_yoy):.1f}%", "—", cb_note),
-        ("估值基准BASE", fmt(base,1), "—", "AUTO" if str(os.environ.get("GOLD_FAIR_BASE","")).upper()=="AUTO" else "Static"),
+        ("估值基准BASE", fmt(base,1), "—", "AUTO" if str(env("GOLD_FAIR_BASE","")).upper()=="AUTO" else "Static"),
     ]
     w1=max(len(r[0]) for r in rows); w2=max(len(str(r[1])) for r in rows); w3=max(len(str(r[2])) for r in rows)
     header=f"{'指标'.ljust(w1)}  {'最新'.ljust(w2)}  {'WoW'.ljust(w3)}  来源"
@@ -434,8 +521,8 @@ def main():
 
     if mode=="status":
         print(msg); return 0
-    url = f"https://api.telegram.org/bot{os.environ.get('TELEGRAM_BOT_TOKEN')}/sendMessage"
-    payload = {"chat_id": os.environ.get("TELEGRAM_CHAT_ID"), "text": msg, "parse_mode": "HTML", "disable_web_page_preview": "true"}
+    url = f"https://api.telegram.org/bot{env('TELEGRAM_BOT_TOKEN')}/sendMessage"
+    payload = {"chat_id": env("TELEGRAM_CHAT_ID"), "text": msg, "parse_mode": "HTML", "disable_web_page_preview": "true"}
     r = requests.post(url, data=payload, timeout=TIMEOUT)
     ok = r.status_code==200 and r.json().get("ok") is True
     if not ok:
