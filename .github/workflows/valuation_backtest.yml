@@ -31,6 +31,17 @@ jobs:
           echo "WGC_CSV_URL=$WGC_CSV_URL"
           curl -I --max-time 10 "$WGC_CSV_URL"
 
+- name: Preflight WGC_CSV_URL
+  env:
+    WGC_CSV_URL: ${{ vars.WGC_CSV_URL }}
+  run: |
+    echo "WGC_CSV_URL=$WGC_CSV_URL"
+    curl -I --max-time 10 "$WGC_CSV_URL"
+    echo "---- first 10 lines ----"
+    curl -sS "$WGC_CSV_URL" | sed -n '1,10p'
+    echo "---- total lines ----"
+    curl -sS "$WGC_CSV_URL" | wc -l
+
       - name: Run grid backtest
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
