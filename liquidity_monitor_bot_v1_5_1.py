@@ -145,10 +145,10 @@ def regression_intercept_base():
     window=int(env("REG_WINDOW_M","36"))
     s_gold=get_xau_series_daily()
     if s_gold is None: return None
-    m_gold=pd.Series(s_gold).resample("M").last().dropna()
+    m_gold=pd.Series(s_gold).resample("ME").last().dropna()
     s_tips=get_series_from_fred("DFII10", days=365*10)
     if s_tips is None or len(s_tips)==0: return None
-    m_tips=s_tips.resample("M").mean().dropna()
+    m_tips=s_tips.resample("ME").mean().dropna()
     url=env("WGC_CSV_URL"); 
     if not url: return None
     try:
