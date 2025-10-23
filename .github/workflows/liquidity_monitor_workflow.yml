@@ -1,4 +1,4 @@
-name: Liquidity Monitor Bot v1.5.3
+name: Liquidity Monitor Bot v1.5.4
 
 on:
   schedule:
@@ -51,4 +51,4 @@ jobs:
           ETF_WINDOW_CANDIDATES: ${{ vars.ETF_WINDOW_CANDIDATES }}
         run: |
           export GOLD_FAIR_BASE="${GOLD_FAIR_BASE:-REG}"
-          python liquidity_monitor_bot_v1_5_3.py
+          python liquidity_monitor_bot_v1_5_4.py
