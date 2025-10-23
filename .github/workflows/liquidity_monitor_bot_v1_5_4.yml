@@ -1,0 +1,63 @@
+name: Liquidity Monitor Bot v1.5.4
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 13 * * 1,3,5"   # 每周一三五 13:00 UTC = 21:00 GMT+8
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lmbot-1-5-4
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pandas requests numpy yfinance
+
+      - name: Run Liquidity Monitor Bot v1.5.4
+        env:
+          # —— 必备/建议变量 & Secret（把下列值放到 Settings→Actions→Variables/Secrets）——
+          FRED_API_KEY:           ${{ secrets.FRED_API_KEY }}
+          FRED_GOLD_SERIES_ID:    ${{ vars.FRED_GOLD_SERIES_ID }}
+
+          # WGC：优先 Raw CSV，不足再走 Sheet CSV 兜底
+          WGC_CSV_URL:            ${{ vars.WGC_CSV_URL }}
+          WGC_SHEET_CSV_URL:      ${{ vars.WGC_SHEET_CSV_URL }}
+
+          # ETF（API 优先，CSV 为回退；至少保证 CSV 有 40+ 日数据可解“样本不足”）
+          SOSOVALUE_API_KEY:      ${{ secrets.SOSOVALUE_API_KEY }}
+          BTC_ETF_API_URL:        ${{ vars.BTC_ETF_API_URL }}
+          BTC_ETF_API_METHOD:     ${{ vars.BTC_ETF_API_METHOD }}
+          BTC_ETF_API_HEADERS:    ${{ vars.BTC_ETF_API_HEADERS }}
+          BTC_ETF_API_BODY:       ${{ vars.BTC_ETF_API_BODY }}
+
+          BTC_ETF_FLOWS_CSV_URL:  ${{ vars.BTC_ETF_FLOWS_CSV_URL }}
+          BTC_ETF_CSV_DATE_FIELD: ${{ vars.BTC_ETF_CSV_DATE_FIELD }}
+          BTC_ETF_CSV_FLOW_FIELD: ${{ vars.BTC_ETF_CSV_FLOW_FIELD }}
+
+          ETF_LONG_D:             ${{ vars.ETF_LONG_D }}
+          ETF_SHORT_D:            ${{ vars.ETF_SHORT_D }}
+
+          VAL_GAP_PCT:            ${{ vars.VAL_GAP_PCT }}
+          UST_AUCTIONS_DELTA:     ${{ vars.UST_AUCTIONS_DELTA }}
+
+          TELEGRAM_BOT_TOKEN:     ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:       ${{ secrets.TELEGRAM_CHAT_ID }}
+
+        run: |
+          python liquidity_monitor_bot_v1_5_4.py
