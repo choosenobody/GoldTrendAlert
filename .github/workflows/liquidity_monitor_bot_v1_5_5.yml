@@ -1,4 +1,4 @@
-name: Liquidity Monitor Bot v1.5.4
+name: Liquidity Monitor Bot v1.5.5
 
 on:
   workflow_dispatch:
@@ -60,4 +60,4 @@ jobs:
           TELEGRAM_CHAT_ID:       ${{ secrets.TELEGRAM_CHAT_ID }}
 
         run: |
-          python liquidity_monitor_bot_v1_5_4.py
+          python liquidity_monitor_bot_v1_5_5.py
