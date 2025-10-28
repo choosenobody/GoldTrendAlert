@@ -20,6 +20,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pandas numpy yfinance
 
+      - name: Permanent fix in repo (patch & commit)
+        run: |
+          python - <<'PY'
+          import re
+          p='liquidity_monitor_bot_v1_5_5.py'
+          s=open(p,'r',encoding='utf-8').read()
+          bad = 'or \n              "https://raw.githubusercontent.com/choosenobody/GoldTrendAlert/refs/heads/main/.bot_state/btc_spot_etf_flows.csv"'
+          good= 'or "https://raw.githubusercontent.com/choosenobody/GoldTrendAlert/refs/heads/main/.bot_state/btc_spot_etf_flows.csv"'
+          if bad in s:
+              s=s.replace(bad,good)
+          s=re.sub(r'(?m)^\s*text\s*=.*$', 'text = "\\n".join(lines)', s)
+          open(p,'w',encoding='utf-8').write(s)
+          print('permanent patch applied')
+          PY
+          git config user.email 'etl-bot@example.com'
+          git config user.name  'etl-bot'
+          git add liquidity_monitor_bot_v1_5_5.py
+          git commit -m 'fix: permanent patch in v1_5_5.py' || echo 'no changes'
+          git push || true
+
       - name: Run bot (v1.5.6)
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
@@ -39,4 +59,4 @@ jobs:
           UST_AUCTIONS_DELTA: ${{ vars.UST_AUCTIONS_DELTA }}
           FRED_GOLD_SERIES_ID: ${{ vars.FRED_GOLD_SERIES_ID }}
         run: |
-          python liquidity_monitor_bot_v1_5_6.py
+          python liquidity_monitor_bot_v1_5_5.py
