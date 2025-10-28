@@ -409,8 +409,8 @@ def main():
     lines.append(f"估值基准BASE      {'REG'}  —       REG")
     lines.append("")
     lines.append(f"诊断：{diag_etf}")
-
-    text="
+text = "
+".join(lines)
 ".join(lines)
 
     bot=env("TELEGRAM_BOT_TOKEN"); chat=env("TELEGRAM_CHAT_ID")
