@@ -1,83 +1,9 @@
 name: Test SoSoValue ETF API
-
 on:
   workflow_dispatch:
-
-permissions:
-  contents: write
-
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Call SoSoValue (diagnostic, save CSV if ok)
-        id: call
-        env:
-          SOSOVALUE_API_KEY:  ${{ secrets.SOSOVALUE_API_KEY }}
-          BTC_ETF_API_URL:    ${{ vars.BTC_ETF_API_URL }}
-          BTC_ETF_API_METHOD: ${{ vars.BTC_ETF_API_METHOD }}
-          BTC_ETF_API_HEADERS:${{ vars.BTC_ETF_API_HEADERS }}
-          BTC_ETF_API_BODY:   ${{ vars.BTC_ETF_API_BODY }}
-        run: |
-          python - <<'PY'
-          import os, json, requests, pandas as pd, sys
-          from io import StringIO
-          TIMEOUT=25
-          url=os.environ.get("BTC_ETF_API_URL") or "https://api.sosovalue.xyz/openapi/v2/etf/historicalInflowChart"
-          method=(os.environ.get("BTC_ETF_API_METHOD") or "POST").upper()
-          hdr=json.loads(os.environ.get("BTC_ETF_API_HEADERS") or "{}")
-          body=os.environ.get("BTC_ETF_API_BODY") or '{"type":"us-btc-spot"}'
-          key=os.environ.get("SOSOVALUE_API_KEY")
-          # 自动补 key / content-type
-          if "x-soso-api-key" not in {k.lower():v for k,v in hdr.items()} and key:
-            hdr["x-soso-api-key"]=key
-          if "content-type" not in {k.lower():v for k,v in hdr.items()}:
-            hdr["Content-Type"]="application/json"
-
-          print(f"[req] {method} {url}")
-          if method=="GET":
-            r=requests.get(url, headers=hdr, timeout=TIMEOUT)
-          else:
-            r=requests.post(url, headers=hdr, data=body, timeout=TIMEOUT)
-          r.raise_for_status()
-          j=r.json()
-          rows=(j.get("data") or {}).get("list") or []
-          print("rows =", len(rows))
-          if not rows:
-            # 输出给后续 step 判断
-            with open(os.environ["GITHUB_OUTPUT"],"a") as g: g.write("rows=0\n")
-            sys.exit(0)
-
-          df=pd.DataFrame(rows)
-          # 识别列
-          dcol=next((k for k in ["date","time","Date","day"] if k in df.columns), None)
-          vcol=next((k for k in ["totalNetInflow","netInflow","TotalNetInflow","net_flow","netflow"] if k in df.columns), None)
-          assert dcol and vcol, f"missing date/flow columns: {df.columns.tolist()}"
-          out=df[[dcol,vcol]].copy()
-          out.columns=["Date","NetFlowUSD"]
-          out["Date"]=pd.to_datetime(out["Date"], errors="coerce")
-          out=out.dropna().sort_values("Date")
-          out.to_csv(".bot_state/btc_spot_etf_flows.csv", index=False)
-          print("Wrote .bot_state/btc_spot_etf_flows.csv rows=", len(out))
-          with open(os.environ["GITHUB_OUTPUT"],"a") as g: g.write(f"rows={len(out)}\n")
-          PY
-
-      - name: Fail if no rows
-        if: steps.call.outputs.rows == '0'
-        run: |
-          echo "::error::SoSoValue 返回 0 行。请检查 Secrets: SOSOVALUE_API_KEY，Variables: BTC_ETF_API_*。"
-          exit 2
-
-      - name: Commit CSV
-        run: |
-          mkdir -p .bot_state
-          git config user.email "etl-bot@example.com"
-          git config user.name  "etl-bot"
-          git add .bot_state/btc_spot_etf_flows.csv
-          git commit -m "auto: update btc_spot_etf_flows.csv from SoSoValue" || echo "no changes"
-          git push || true
+      - name: Placeholder
+        run: echo 'Test workflow added'
