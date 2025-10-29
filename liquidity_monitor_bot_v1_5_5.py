@@ -412,6 +412,7 @@ def main():
 text = "
 ".join(lines)
 ".join(lines)
+".join(lines)
 
     bot=env("TELEGRAM_BOT_TOKEN"); chat=env("TELEGRAM_CHAT_ID")
     if bot and chat:
